@@ -26,7 +26,21 @@ each can be run alone.
    ledger, and applies the failure breaker.
 
 Run `python3 scripts/sc_selftest.py` after changing any script. It asserts the
-33 invariants that keep unattended work safe, in a temp sandbox.
+invariants that keep unattended work safe, in a temp sandbox.
+
+**Before trusting the miner, calibrate it.** The keyword heuristics ship as a
+starting point tuned on one small corpus, not measured optima. `sc_eval.py` turns
+that into a number:
+
+```sh
+python3 scripts/sc_eval.py sample --n 20    # label leads real / noise
+python3 scripts/sc_eval.py score            # precision, recall, F1
+python3 scripts/sc_eval.py sweep            # best lead threshold
+python3 scripts/sc_eval.py words            # which terms are noise
+```
+
+Then tune `mining_tuning` in config.json rather than editing code. Below about
+70% precision, treat the backlog as unvalidated.
 
 ## First run
 
@@ -94,23 +108,23 @@ Wire `sc_cycle.sh` to your agent of choice if you want full autonomy.
 ## Exact quota, not a guess
 
 Claude Code hands its status-line command a JSON payload containing
-@@rate_limits.five_hour@@ and @@rate_limits.seven_day@@ with @@used_percentage@@ and
-@@resets_at@@. That is first-party data and it counts every machine, the web UI
+`rate_limits.five_hour` and `rate_limits.seven_day` with `used_percentage` and
+`resets_at`. That is first-party data and it counts every machine, the web UI
 and mobile - none of which a transcript estimate can see.
 
-Register the capture once, in @@~/.claude/settings.json@@:
+Register the capture once, in `~/.claude/settings.json`:
 
-@@@json
+```json
 {
   "statusLine": {
     "type": "command",
     "command": "python3 ~/.agents/skills/sidecar/scripts/sc_statusline.py"
   }
 }
-@@@
+```
 
-@@sc_statusline.py@@ records each payload to @@state/rate_limits.json@@ and prints a
-one-line status. @@sc_run.py plan@@ then prefers that reading over its own estimate,
+`sc_statusline.py` records each payload to `state/rate_limits.json` and prints a
+one-line status. `sc_run.py plan` then prefers that reading over its own estimate,
 and ignores it once it is more than six hours old. If the capture time cannot be
 read at all, the reading is discarded rather than trusted: a stale percentage
 would otherwise unlock work on a window that is already spent.
@@ -166,7 +180,8 @@ scripts/sc_run.py        plan / dispatch / reconcile
 scripts/sc_backlog.py    human approval loop
 scripts/sc_render.py     self-contained status dashboard
 scripts/sc_schedule.py   launchd timer
-scripts/sc_selftest.py   33 invariant checks
+scripts/sc_eval.py      miner calibration: labels, precision, threshold sweep
+scripts/sc_selftest.py   invariant checks
 ```
 
 ## Limits worth knowing

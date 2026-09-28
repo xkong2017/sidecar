@@ -78,6 +78,28 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_sessions_per_run": 400,
         "redact": True,
     },
+    # Mining vocabulary lives in config so it can be tuned against a real corpus
+    # without editing code. The values shipped here are a starting point derived
+    # from a small sample, not measured optima - see sc_eval.py to calibrate
+    # them against your own labelled data.
+    "mining_tuning": {
+        "parked_words": [
+            "later", "defer", "deferred", "postpone", "blocked", "waiting on",
+            "waiting for", "for now", "revisit", "come back to", "next session",
+            "next time", "after we", "once we", "not now", "skip", "backlog",
+            "park", "on hold", "someday", "out of scope", "todo", "fixme",
+            "hack", "temporary", "workaround",
+        ],
+        "friction_words": [
+            "still not working", "still broken", "still failing", "keeps failing",
+            "again", "third time", "didn't work", "doesn't work", "not what i asked",
+            "i already", "why is it", "why does it", "frustrat", "annoying",
+            "that's wrong", "still wrong", "regression",
+        ],
+        "max_candidates": 40,
+        "max_leads": 60,
+        "lead_promotion_threshold": 2,
+    },
     "quota": {
         "window_hours": 5.0,
         "providers": [

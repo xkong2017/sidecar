@@ -271,6 +271,53 @@ def main():
         check("an unreadable capture time fails closed",
               prov.get("exact_fresh") is False, str(prov)[:240])
 
+        print("\n[probe] unmeasurable is not idle")
+        code, doc, err = sh_json(["-c",
+            "import sys; sys.path.insert(0, %r); import sc_common as C;"
+            " real = C.run_cmd;"
+            " C.run_cmd = lambda c, timeout=20: ({'ok': False, 'code': 127, 'out': '', 'err': 'nf'}"
+            " if c[0].startswith(('/usr/sbin/', '/usr/bin/pmset', '/usr/bin/vm_stat',"
+            " '/usr/bin/memory_pressure')) else real(c, timeout=timeout));"
+            " import sc_probe as P;"
+            " cfg = C.load_config()['machine'];"
+            " import json as _j; m = P.read_memory(cfg);"
+            " print(_j.dumps([m['mem_measured'], m['mem_free_pct']]))" % HERE], env)
+        check("memory is reported unmeasured (None), not 0%%, without vm_stat",
+              code == 0 and doc == [False, None], str(doc)[:200])
+
+        print("\n[eval] calibration loop")
+        code, doc, err = sh_json(["sc_eval.py", "sample", "--n", "5"], env)
+        check("eval sample writes a sheet", code == 0 and doc and doc.get("sheet"), err[:200])
+
+        code, doc, err = sh_json(["sc_eval.py", "score"], env)
+        check("eval score reports insufficient data rather than a number",
+              code == 0 and doc and doc.get("precision_pct") is None, str(doc)[:200])
+
+        # Label against real ids so the scoring path is exercised end to end.
+        code, bl, _ = sh_json(["-c",
+            "import json,os,sys; b=json.load(open(os.path.join(os.environ['SIDECAR_HOME'],"
+            "'state','backlog.json'))); print(' '.join(l['id'] for l in b.get('leads',[])[:2]))"],
+            env)
+        lead_ids = str(bl).split() if isinstance(bl, str) else []
+        if lead_ids:
+            sh(["sc_eval.py", "label", lead_ids[0], "real"], env)
+            if len(lead_ids) > 1:
+                sh(["sc_eval.py", "label", lead_ids[1], "noise"], env)
+            code, doc, err = sh_json(["sc_eval.py", "sweep"], env)
+            check("eval sweep returns a point per threshold",
+                  code == 0 and doc and len(doc.get("points", [])) == 5, str(doc)[:200])
+            code, doc, err = sh_json(["sc_eval.py", "words"], env)
+            check("eval words ranks vocabulary", code == 0 and doc is not None, err[:200])
+
+        print("\n[portability] config-driven tuning")
+        with open(os.path.join(home, "config.json"), "w") as fh:
+            json.dump({"mining_tuning": {"lead_promotion_threshold": 99,
+                                        "max_leads": 1, "parked_words": ["zzzz"]}}, fh)
+        code, doc, err = sh_json(["sc_mine.py", "--no-history"], env)
+        check("mining tuning is read from config, not hardcoded",
+              code == 0 and doc is not None and doc["counts"]["leads"] <= 1,
+              str((doc or {}).get("counts"))[:200])
+
     finally:
         shutil.rmtree(home, ignore_errors=True)
 

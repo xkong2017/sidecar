@@ -21,21 +21,37 @@ import sc_common as C  # noqa: E402
 # --------------------------------------------------------------------------
 
 def read_cpu(machine_cfg):
-    """Load average normalised by core count, plus instantaneous CPU busy %."""
+    """Load average normalised by core count, plus instantaneous CPU busy %.
+
+    Portable across macOS and Linux: os.getloadavg works on both, and the core
+    count comes from os.cpu_count with the platform-specific tool only as a
+    refinement. Returns load1_available=False when no reading was possible, so
+    the caller can tell "idle" apart from "could not measure".
+    """
     cores = machine_cfg.get("cpu_cores") or 0
+    if not cores:
+        cores = os.cpu_count() or 0
     if not cores:
         r = C.run_cmd(["/usr/sbin/sysctl", "-n", "hw.ncpu"])
         try:
-            cores = int(r["out"]) or 8
+            cores = int(r["out"])
         except ValueError:
-            cores = 8
+            cores = 0
+    if not cores:
+        cores = 1
 
     load1 = load5 = load15 = 0.0
-    r = C.run_cmd(["/usr/sbin/sysctl", "-n", "vm.loadavg"])
-    if r["ok"]:
-        nums = re.findall(r"[0-9]+(?:\.[0-9]+)?", r["out"])
-        if len(nums) >= 3:
-            load1, load5, load15 = (float(x) for x in nums[:3])
+    load_available = False
+    try:
+        load1, load5, load15 = os.getloadavg()
+        load_available = True
+    except (OSError, AttributeError):
+        r = C.run_cmd(["/usr/sbin/sysctl", "-n", "vm.loadavg"])
+        if r["ok"]:
+            nums = re.findall(r"[0-9]+(?:\.[0-9]+)?", r["out"])
+            if len(nums) >= 3:
+                load1, load5, load15 = (float(x) for x in nums[:3])
+                load_available = True
 
     # pressure = load per core; 1.0 means every core has exactly one runnable thread
     pressure = load1 / float(cores)
@@ -57,6 +73,7 @@ def read_cpu(machine_cfg):
         "load1": load1,
         "load5": load5,
         "load15": load15,
+        "load_available": load_available,
         "load_per_core": round(pressure, 3),
         "cpu_busy_pct_of_cores": busy_pct,
     }
@@ -78,19 +95,33 @@ def read_user_activity():
         if m:
             locked = (m.group(1) == "Yes")
 
-    return {"user_idle_s": idle_s, "console_locked": locked}
+    # None means the platform exposes no HID idle counter (e.g. Linux). That is
+    # "not measured", which the gate treats differently from "user is active".
+    return {"user_idle_s": idle_s, "console_locked": locked,
+            "user_activity_measured": idle_s is not None}
 
 
 def read_memory(cfg):
-    """Honest memory headroom: free + inactive + speculative + purgeable pages."""
+    """Memory headroom, as the pessimistic of two independent estimators.
+
+    macOS exposes this through vm_stat and memory_pressure; Linux through
+    /proc/meminfo. When neither yields a number the result is reported as
+    unknown rather than 0%, because 0% would fail the gate forever on a machine
+    that simply keeps its metrics somewhere else.
+    """
     page_size = 16384
-    total_pages = 0
     r = C.run_cmd(["/usr/sbin/sysctl", "-n", "hw.pagesize"])
     if r["ok"]:
         try:
             page_size = int(r["out"])
         except ValueError:
             pass
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE") or page_size
+    except (ValueError, OSError, AttributeError):
+        pass
+
+    total_pages = 0
     r = C.run_cmd(["/usr/sbin/sysctl", "-n", "hw.memsize"])
     if r["ok"]:
         try:
@@ -98,41 +129,64 @@ def read_memory(cfg):
         except ValueError:
             pass
 
+    free_pct = None
+    mp_pct = None
     stats = {}
-    r = C.run_cmd(["/usr/bin/vm_stat"])
-    if r["ok"]:
-        for line in r["out"].splitlines():
+
+    vm = C.run_cmd(["/usr/bin/vm_stat"])
+    if vm["ok"]:
+        for line in vm["out"].splitlines():
             m = re.match(r"([A-Za-z][^:]*):\s+([0-9]+)\.", line)
             if m:
                 stats[m.group(1).strip()] = int(m.group(2))
+        if not total_pages:
+            total_pages = sum(stats.values()) or 1
+        available = (stats.get("Pages free", 0)
+                     + stats.get("Pages inactive", 0)
+                     + stats.get("Pages speculative", 0)
+                     + stats.get("Pages purgeable", 0))
+        free_pct = round(100.0 * available / total_pages, 1)
 
-    if not total_pages:
-        total_pages = sum(stats.values()) or 1
+        mp = C.run_cmd(["/usr/bin/memory_pressure"], timeout=15)
+        if mp["ok"]:
+            m = re.search(r"System-wide memory free percentage:\s*([0-9]+)%", mp["out"])
+            if m:
+                mp_pct = int(m.group(1))
+    else:
+        # Linux and anything else with /proc
+        info = {}
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        info[parts[0].strip()] = parts[1].strip()
+        except OSError:
+            info = {}
+        if info:
+            def kb(key):
+                try:
+                    return float(info.get(key, "0").split()[0])
+                except (ValueError, IndexError):
+                    return 0.0
+            total_kb = kb("MemTotal")
+            avail_kb = kb("MemAvailable")
+            if not total_kb:
+                avail_kb = kb("MemFree") + kb("Buffers") + kb("Cached")
+                total_kb = avail_kb + kb("MemFree")
+            if total_kb:
+                free_pct = round(100.0 * avail_kb / total_kb, 1)
 
-    available = (stats.get("Pages free", 0)
-                 + stats.get("Pages inactive", 0)
-                 + stats.get("Pages speculative", 0)
-                 + stats.get("Pages purgeable", 0))
-    free_pct = round(100.0 * available / total_pages, 1)
-
-    # memory_pressure gives a second, differently-computed opinion
-    mp_pct = None
-    r = C.run_cmd(["/usr/bin/memory_pressure"], timeout=15)
-    if r["ok"]:
-        m = re.search(r"System-wide memory free percentage:\s*([0-9]+)%", r["out"])
-        if m:
-            mp_pct = int(m.group(1))
-
-    # Two independent estimators disagree by design (vm_stat counts inactive pages
-    # as reclaimable, memory_pressure discounts them). For a guardrail we take the
-    # pessimistic one: undershooting the estimate costs us a skipped job, overshooting
-    # it costs the user a swapping machine.
-    honest = free_pct if mp_pct is None else min(free_pct, float(mp_pct))
+    # Take the pessimistic estimator: undershooting costs a skipped job,
+    # overshooting costs the user a swapping machine.
+    candidates = [x for x in (free_pct, mp_pct) if x is not None]
+    honest = min(candidates) if candidates else None
 
     return {
-        "mem_free_pct": round(honest, 1),
+        "mem_free_pct": honest,
         "mem_free_pct_vmstat": free_pct,
         "mem_free_pct_pressure": mp_pct,
+        "mem_measured": honest is not None,
         "compressed_pages": stats.get("Pages occupied by compressor", 0),
         "swapouts": stats.get("Swapouts", 0),
     }
@@ -158,10 +212,12 @@ def read_gpu():
 
 def read_thermal_and_power(machine_cfg):
     out = {"thermal_limited": None, "cpu_speed_limit": None, "on_ac_power": None,
-           "battery_pct": None, "sleep_prevented_by": []}
+           "battery_pct": None, "sleep_prevented_by": [],
+           "thermal_measured": False, "power_measured": False}
 
     r = C.run_cmd(["/usr/bin/pmset", "-g", "therm"])
     if r["ok"]:
+        out["thermal_measured"] = True
         m = re.search(r"CPU_Speed_Limit\s*=\s*([0-9]+)", r["out"])
         if m:
             out["cpu_speed_limit"] = int(m.group(1))
@@ -171,10 +227,22 @@ def read_thermal_and_power(machine_cfg):
 
     r = C.run_cmd(["/usr/bin/pmset", "-g", "batt"])
     if r["ok"]:
+        out["power_measured"] = True
         out["on_ac_power"] = "AC Power" in r["out"]
         m = re.search(r"([0-9]+)%", r["out"])
         if m:
             out["battery_pct"] = int(m.group(1))
+    else:
+        # Linux: a desktop usually has no battery at all, which is wall power.
+        try:
+            with open("/sys/class/power_supply/AC0/online", "r") as fh:
+                out["on_ac_power"] = fh.read().strip() == "1"
+                out["power_measured"] = True
+        except OSError:
+            if os.path.isdir("/sys/class/power_supply"):
+                names = os.listdir("/sys/class/power_supply")
+                out["on_ac_power"] = not any(n.startswith("BAT") for n in names)
+                out["power_measured"] = True
 
     r = C.run_cmd(["/usr/bin/pmset", "-g"])
     if r["ok"]:
@@ -246,40 +314,63 @@ def probe_endpoint(ep):
 # --------------------------------------------------------------------------
 
 def decide(machine_cfg, cpu, user, mem, gpu, power, endpoints):
-    """Collapse raw signals into green / yellow / red with an explicit reason list."""
-    reasons = []
+    """Collapse raw signals into green / yellow / red with an explicit reason list.
+
+    Two principles, both learned from getting them wrong:
+
+      Unmeasurable is not the same as idle. A signal the platform cannot provide
+      must not silently pass the gate; it becomes a warning so the operator can
+      see the decision rests on fewer signals than they think.
+
+      Unmeasurable is not the same as red either. Reporting 0% memory because
+      vm_stat is absent would lock the gate shut forever on a Linux box that is
+      actually fine.
+    """
     blocking = []
     warnings = []
 
     # --- CPU
-    lp = cpu["load_per_core"]
-    if lp >= machine_cfg["load_ceiling_yellow"]:
-        blocking.append("cpu load %.2f/core >= %.2f" % (lp, machine_cfg["load_ceiling_yellow"]))
-    elif lp >= machine_cfg["load_ceiling_green"]:
-        warnings.append("cpu load %.2f/core above green %.2f" % (lp, machine_cfg["load_ceiling_green"]))
+    if not cpu.get("load_available", True):
+        warnings.append("cpu load unavailable on this platform; gating on other signals")
+    else:
+        lp = cpu["load_per_core"]
+        if lp >= machine_cfg["load_ceiling_yellow"]:
+            blocking.append("cpu load %.2f/core >= %.2f" % (lp, machine_cfg["load_ceiling_yellow"]))
+        elif lp >= machine_cfg["load_ceiling_green"]:
+            warnings.append("cpu load %.2f/core above green %.2f" % (lp, machine_cfg["load_ceiling_green"]))
 
     # --- human presence
-    idle = user["user_idle_s"]
-    if idle is not None:
-        if idle < machine_cfg["user_idle_yellow_s"]:
-            blocking.append("user active %ss ago" % idle)
-        elif idle < machine_cfg["user_idle_green_s"]:
-            warnings.append("user recently active (%ss idle)" % idle)
-    if user["console_locked"] and machine_cfg["block_when_console_locked"]:
+    idle = user.get("user_idle_s")
+    if idle is None:
+        warnings.append("user idle time not measurable on this platform; "
+                        "cannot confirm the human is away")
+    elif idle < machine_cfg["user_idle_yellow_s"]:
+        blocking.append("user active %ss ago" % idle)
+    elif idle < machine_cfg["user_idle_green_s"]:
+        warnings.append("user recently active (%ss idle)" % idle)
+
+    if user.get("console_locked") and machine_cfg["block_when_console_locked"]:
         blocking.append("console locked")
 
     # --- memory
-    if mem["mem_free_pct"] < machine_cfg["min_free_mem_pct"]:
-        blocking.append("memory headroom %.1f%% < %s%%"
-                        % (mem["mem_free_pct"], machine_cfg["min_free_mem_pct"]))
-    elif mem["mem_free_pct"] < machine_cfg["min_free_mem_pct"] + 10:
-        warnings.append("memory headroom low (%.1f%%)" % mem["mem_free_pct"])
+    if not mem.get("mem_measured"):
+        warnings.append("memory headroom not measurable on this platform")
+    else:
+        free = mem["mem_free_pct"]
+        if free < machine_cfg["min_free_mem_pct"]:
+            blocking.append("memory headroom %.1f%% < %s%%"
+                            % (free, machine_cfg["min_free_mem_pct"]))
+        elif free < machine_cfg["min_free_mem_pct"] + 10:
+            warnings.append("memory headroom low (%.1f%%)" % free)
 
     # --- thermal / power
-    if power["thermal_limited"]:
+    if power.get("thermal_measured") is not False and power.get("thermal_limited"):
         warnings.append("thermal throttling active (speed limit %s%%)" % power["cpu_speed_limit"])
-    if machine_cfg["require_ac_power"] and power["on_ac_power"] is False:
-        blocking.append("on battery")
+    if machine_cfg["require_ac_power"]:
+        if power.get("on_ac_power") is False:
+            blocking.append("on battery")
+        elif power.get("on_ac_power") is None:
+            warnings.append("power source unknown; cannot confirm wall power")
 
     # --- remote endpoints
     for ep in endpoints:
@@ -300,11 +391,21 @@ def decide(machine_cfg, cpu, user, mem, gpu, power, endpoints):
         verdict = "green"
         reasons = ["all signals within green thresholds"]
 
+    degraded = [w for w in warnings if "not measurable" in w or "unavailable" in w
+                or "unknown" in w]
+
     return {
         "verdict": verdict,
         "reasons": reasons,
         "blocking": blocking,
         "warnings": warnings,
+        "degraded": degraded,
+        "signals_measured": {
+            "cpu_load": bool(cpu.get("load_available", True)),
+            "user_activity": bool(user.get("user_activity_measured")),
+            "memory": bool(mem.get("mem_measured")),
+            "power": power.get("on_ac_power") is not None,
+        },
         "allowed_work": {
             "green": ["heavy: builds, test suites, multi-agent fan-out, local GPU jobs"],
             "yellow": ["light: read-only research, planning, single-file edits, note-taking"],
@@ -348,7 +449,10 @@ def main():
         "endpoints": endpoints,
         "verdict": verdict["verdict"],
         "reasons": verdict["reasons"],
+        "degraded": verdict["degraded"],
+        "signals_measured": verdict["signals_measured"],
         "allowed_work": verdict["allowed_work"],
+        "platform": sys.platform,
     }
 
     if args.quiet:

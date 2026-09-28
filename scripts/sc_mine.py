@@ -76,6 +76,9 @@ def fingerprint(text):
 
 # Vocabulary-level signals. Deliberately loose: these mark passages worth a
 # human or model reading again, not conclusions. A phrase match is raw material.
+# Defaults. These are overridable from config.mining_tuning so the vocabulary
+# can be tuned against a real corpus without editing this file. sc_eval.py
+# measures how well they do on data you have labelled yourself.
 PARKED_WORDS = [
     "later", "defer", "deferred", "postpone", "blocked", "waiting on", "waiting for",
     "for now", "revisit", "come back to", "next session", "next time", "after we",
@@ -89,6 +92,22 @@ FRICTION_WORDS = [
     "i already", "why is it", "why does it", "frustrat", "annoying",
     "that's wrong", "still wrong", "regression",
 ]
+
+
+def tuning(cfg):
+    """Merged mining vocabulary: shipped defaults, overridden by config."""
+    import sc_common as _C
+    base = {
+        "parked_words": PARKED_WORDS,
+        "friction_words": FRICTION_WORDS,
+        "max_candidates": 40,
+        "max_leads": 60,
+        "lead_promotion_threshold": 2,
+    }
+    base.update(_C.DEFAULT_CONFIG.get("mining_tuning", {}))
+    base.update((cfg or {}).get("mining_tuning", {}))
+    return base
+
 
 PREFERENCE_MARKERS = [
     r"\bI (?:prefer|like|want|always|never|hate|dislike)\b",
@@ -221,6 +240,7 @@ def mine_history(cfg, since_ts):
     its transcript so a later stage can pull real context for it.
     """
     mining = cfg["mining"]
+    tune = tuning(cfg)
     limit = int(mining.get("max_sessions_per_run", 400))
     roots = [os.path.expanduser(r) for r in mining.get("transcript_roots", [])]
 
@@ -282,7 +302,7 @@ def mine_history(cfg, since_ts):
             ctx = {"session": sid, "cwd": cwd, "when": ts,
                    "transcript": os.path.relpath(path, os.path.expanduser("~"))}
 
-            for word in PARKED_WORDS:
+            for word in tune["parked_words"]:
                 pos = low.find(word)
                 if pos >= 0:
                     quote = redact(sentence_around(text, pos), 200)
@@ -290,7 +310,7 @@ def mine_history(cfg, since_ts):
                         parked[quote] += 1
                         parked_context.setdefault(quote, ctx)
 
-            for word in FRICTION_WORDS:
+            for word in tune["friction_words"]:
                 pos = low.find(word)
                 if pos >= 0:
                     quote = redact(sentence_around(text, pos), 200)
@@ -776,11 +796,12 @@ def build_candidates(cfg, history, repos):
                 **sc,
             })
 
+    cap = int(tuning(cfg).get("max_candidates", 40))
     candidates.sort(key=lambda c: (c["tier"], -c["score"], c["title"]))
-    return candidates
+    return candidates[:cap]
 
 
-def build_leads(history, repos):
+def build_leads(cfg, history, repos):
     """Raw material for the interpretation stage. Never auto-executed.
 
     Keyword matching over transcripts is far too blunt to produce work on its
@@ -791,7 +812,12 @@ def build_leads(history, repos):
     """
     leads = []
 
-    for item in history.get("parked_signals", [])[:24]:
+    tune = tuning(cfg)
+    min_hits = int(tune.get("lead_promotion_threshold", 1))
+    max_leads = int(tune.get("max_leads", 60))
+    park_cap = max(1, max_leads * 2 // 5)
+    for item in [s for s in history.get("parked_signals", [])
+                 if s.get("count", 1) >= min_hits][:park_cap]:
         leads.append({
             "id": "lead:parked:" + fingerprint(item["quote"]),
             "kind": "possibly_parked",
@@ -805,7 +831,8 @@ def build_leads(history, repos):
                            "and names a file or command that would close it"),
         })
 
-    for item in history.get("friction_signals", [])[:18]:
+    for item in [s for s in history.get("friction_signals", [])
+                 if s.get("count", 1) >= min_hits][:max(1, max_leads // 3)]:
         leads.append({
             "id": "lead:friction:" + fingerprint(item["quote"]),
             "kind": "possible_friction",
@@ -819,9 +846,10 @@ def build_leads(history, repos):
                            "and a concrete rule, default, or tool change would remove it"),
         })
 
+    repo_leads = []
     for repo in repos:
         for lead in repo.get("leads", []):
-            leads.append({
+            repo_leads.append({
                 "id": "lead:%s:%s" % (lead["id"], fingerprint(repo["path"])),
                 "kind": "low_materiality",
                 "quote": lead["evidence"],
@@ -833,7 +861,9 @@ def build_leads(history, repos):
                 "promote_if": "the human confirms this project still matters",
             })
 
-    return leads
+    # max_leads caps the whole list, not just the history half. Capping only one
+    # source would let the other grow without bound as the repo scan widens.
+    return (leads + repo_leads)[:max_leads]
 
 
 def dedupe(candidates, previous):
@@ -925,7 +955,7 @@ def main():
     repos.sort(key=lambda r: r["facts"].get("last_commit_age_days") or 0)
 
     candidates = build_candidates(cfg, history, repos)
-    leads = build_leads(history, repos)
+    leads = build_leads(cfg, history, repos)
 
     previous = C.read_json(BACKLOG, {}) or {}
     candidates, tombstones = dedupe(candidates, previous)

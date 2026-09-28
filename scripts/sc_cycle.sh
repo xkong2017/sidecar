@@ -93,17 +93,27 @@ DIRECTIVE:
 $(cat "$DIRECTIVE")
 PROMPT
 
+# Resolve the agent binary through PATH. Hardcoding ~/.local/bin assumed one
+# particular installer; the point of this script is to drive whichever agent
+# the operator actually has.
+case "$AGENT" in
+  claude) CLAUDE_BIN="$(command -v claude || true)"
+          if [ -z "$CLAUDE_BIN" ]; then log "claude not found on PATH"; exit 1; fi ;;
+  codex)  CODEX_BIN="$(command -v codex || true)"
+          if [ -z "$CODEX_BIN" ]; then log "codex not found on PATH"; exit 1; fi ;;
+esac
+
 STARTED=$(date +%s)
 log "starting agent: $AGENT"
 case "$AGENT" in
   claude)
-    "$HOME/.local/bin/claude" -p "$(cat "$PROMPT_FILE")" \
+    "$CLAUDE_BIN" -p "$(cat "$PROMPT_FILE")" \
       --permission-mode acceptEdits \
       "${POLICY_ARGS[@]/#--target=/--add-dir=}" \
       > "$RUN_DIR/agent.log" 2>&1 || true
     ;;
   codex)
-    "$HOME/.local/bin/codex" exec "$(cat "$PROMPT_FILE")" \
+    "$CODEX_BIN" exec "$(cat "$PROMPT_FILE")" \
       > "$RUN_DIR/agent.log" 2>&1 || true
     ;;
   custom)

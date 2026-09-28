@@ -56,7 +56,10 @@ def write_plist(interval_minutes):
         "StandardErrorPath": PLAN_LOG,
         "EnvironmentVariables": {
             "HOME": C.HOME,
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+            # Inherit the PATH this process was launched with, rather than
+            # assuming Homebrew on Apple Silicon. launchd gives agents a bare
+            # PATH, so a hardcoded guess breaks any other layout.
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
             "SIDECAR_HOME": C.SIDECAR_HOME,
         },
         "ProcessType": "Background",
